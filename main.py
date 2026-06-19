@@ -1,4 +1,4 @@
-"""Starter template for prompting Claude via claude-agent-sdk."""
+"""crux-lab — playful sandbox for learning agentic tooling."""
 
 import os
 from pathlib import Path
@@ -12,10 +12,11 @@ from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, qu
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 INITIAL_PROMPT = """
-You are helping me build a project called crux_bio.
+You are helping me in crux-lab — my bio-flavored playground for learning
+agentic programming and building with AI agents.
 
-For this first message, briefly introduce yourself and confirm you can read this prompt.
-Then ask what I want to work on first.
+Briefly introduce yourself and confirm you can read this prompt.
+Then ask what experiment I want to run first.
 """.strip()
 
 
