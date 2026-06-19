@@ -27,6 +27,7 @@ async def run_prompt(prompt: str = INITIAL_PROMPT) -> None:
         )
 
     options = ClaudeAgentOptions(
+        model="haiku",
         cwd=str(Path(__file__).resolve().parent),
         max_turns=1,
     )
