@@ -19,14 +19,44 @@ SEARCH_SCHEMA: dict[str, Any] = {
         "query": {
             "type": "string",
             "description": (
-                "Europe PMC search query. Examples: 'CRISPR', "
-                "'auth:smith', 'journal:nature', '\"gene therapy\"'"
+                "Europe PMC search query. Supports field syntax: "
+                "'auth:smith', 'journal:nature', '\"exact phrase\"', "
+                "'MESH:D015967'. Do NOT include citation filters here — "
+                "use min_citations instead."
             ),
         },
         "page_size": {
             "type": "integer",
             "description": f"Number of results to return (1-{MAX_PAGE_SIZE}).",
             "default": 10,
+        },
+        "sort": {
+            "type": "string",
+            "enum": ["relevance", "citedByCount", "date"],
+            "description": (
+                "Sort order. Use 'citedByCount' for established/high-impact papers, "
+                "'date' for the most recent papers, 'relevance' (default) for "
+                "broad topic searches."
+            ),
+            "default": "relevance",
+        },
+        "min_citations": {
+            "type": "integer",
+            "description": (
+                "Minimum citation count. Set to 20+ for established literature passes, "
+                "0 for recent-paper passes where low citation count is expected."
+            ),
+            "default": 0,
+        },
+        "include_abstracts": {
+            "type": "boolean",
+            "description": (
+                "Whether to return full abstracts. "
+                "Use false (default) for Phase 1 discovery — surveys titles and "
+                "citations cheaply across many results. "
+                "Use true only for Phase 2 deep-reading of your shortlisted candidates."
+            ),
+            "default": False,
         },
     },
     "required": ["query"],
@@ -46,6 +76,7 @@ def _format_hit(hit: dict[str, Any]) -> dict[str, Any]:
         "doi": hit.get("doi"),
         "is_open_access": hit.get("isOpenAccess"),
         "cited_by_count": hit.get("citedByCount"),
+        "abstract": hit.get("abstractText"),
     }
 
 
@@ -63,13 +94,23 @@ async def search_literature(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     page_size = min(max(int(args.get("page_size", 10)), 1), MAX_PAGE_SIZE)
+    sort = args.get("sort", "relevance")
+    min_citations = max(0, int(args.get("min_citations", 0)))
+    include_abstracts = bool(args.get("include_abstracts", False))
 
-    params = {
+    if min_citations > 0:
+        query = f"{query} (CITED_BY_COUNT:[{min_citations} TO *])"
+
+    sort_map = {"citedByCount": "citedByCount:desc", "date": "P_PDATE_D:desc"}
+
+    params: dict[str, Any] = {
         "query": query,
         "format": "json",
-        "resultType": "lite",
+        "resultType": "core" if include_abstracts else "lite",
         "pageSize": page_size,
     }
+    if sort in sort_map:
+        params["sort"] = sort_map[sort]
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -105,5 +146,4 @@ europepmc_server = create_sdk_mcp_server(
     tools=[search_literature],
 )
 
-# Tool name Claude uses when calling through the SDK MCP server.
 EUROPEPMC_TOOL = "mcp__europepmc__search_literature"

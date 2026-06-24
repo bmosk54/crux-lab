@@ -1,3 +1,4 @@
 claude-agent-sdk
 python-dotenv
 httpx
+pydantic>=2.0
