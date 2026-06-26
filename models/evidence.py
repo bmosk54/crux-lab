@@ -1,4 +1,4 @@
-"""Pydantic models for structured evidence, candidate ranking, and scoring."""
+"""Pydantic models for the crux-lab pipeline: candidates, evidence, synthesis, verdict."""
 
 from __future__ import annotations
 
@@ -25,18 +25,9 @@ Directness = Literal[
     "tangential", # Connection requires multiple reasoning steps
 ]
 
-# ---------------------------------------------------------------------------
-# Ranking weights — relevance matters most, then citation impact, then
-# how specifically the paper targets the hypothesis. Must sum to 1.0.
-# ---------------------------------------------------------------------------
-W_RELEVANCE = 0.45
-W_CITATION = 0.30
-W_SPECIFICITY = 0.25
+Strength = Literal["strong", "moderate", "weak"]
 
-# Relevance floor for papers that entered the pool only via a citation-sorted
-# (high-impact) pass: they matched the query terms but lack a relevance rank,
-# so give them a moderate relevance rather than zero.
-RELEVANCE_FLOOR_ESTABLISHED = 0.4
+ComponentStatus = Literal["supported", "refuted", "mixed", "untested"]
 
 _STOPWORDS = {
     "the", "and", "for", "are", "was", "with", "that", "this", "from", "can",
@@ -48,7 +39,7 @@ _STOPWORDS = {
 
 
 # ---------------------------------------------------------------------------
-# Final evidence models (LLM output)
+# Evidence models (gatherer output)
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +77,50 @@ class EvidenceSet(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Candidate model (Phase-1 discovery + Python ranking)
+# Synthesis models (synthesizer output)
+# ---------------------------------------------------------------------------
+
+
+class SynthesisPoint(BaseModel):
+    point: str = Field(description="A distinct line of argument (merged across papers)")
+    strength: Strength = Field(description="Judged strength of this line of argument")
+
+
+class Synthesis(BaseModel):
+    supporting_points: List[SynthesisPoint] = Field(default_factory=list)
+    counter_points: List[SynthesisPoint] = Field(default_factory=list)
+    supporting_summary: str = ""
+    counter_summary: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Verdict models (verdict generator output)
+# ---------------------------------------------------------------------------
+
+
+class ClaimComponent(BaseModel):
+    component: str = Field(description="A distinct sub-component or assumption of the claim")
+    status: ComponentStatus = Field(description="How the evidence treats this sub-component")
+    note: str = ""
+
+
+class Verdict(BaseModel):
+    support_score: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="0.0 = strongly refuted, 0.5 = mixed, 1.0 = strongly supported",
+    )
+    confidence: Literal["high", "moderate", "low"] = Field(
+        default="low",
+        description="How much credible evidence exists to judge at all",
+    )
+    components: List[ClaimComponent] = Field(default_factory=list)
+    strongest_supported_claim: str = ""
+    unsupported_aspects: List[str] = Field(default_factory=list)
+    reasoning: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Candidate model (discovery + screening)
 # ---------------------------------------------------------------------------
 
 
@@ -103,19 +137,15 @@ class CandidatePaper(BaseModel):
     cited_by_count: int = 0
     abstract: str = ""
 
-    # Ranking signals
+    # Discovery signals (informational only — no hardcoded scoring formula)
     pools: List[str] = Field(default_factory=list)  # "supporting" / "refuting"
     found_count: int = 0
-    best_rank: float = 0.0
     established: bool = False  # surfaced by a citation-sorted (high-impact) pass
-    relevance: float = 0.0
-    citation_score: float = 0.0
-    specificity: float = 0.0
-    composite: float = 0.0
+    specificity: float = 0.0   # title/hypothesis keyword overlap, for the relevance gate
 
 
 # ---------------------------------------------------------------------------
-# Scoring functions
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -128,8 +158,8 @@ def extract_keywords(text: str) -> set[str]:
 def compute_specificity(title: str, hypothesis_keywords: set[str]) -> float:
     """Fraction of hypothesis keywords present in the paper title (0–1).
 
-    Rewards papers whose title narrowly targets the hypothesis variables over
-    broad reviews that merely mention the topic.
+    Used only as a cheap minimum-relevance gate before LLM screening — not as a
+    weighted ranking score.
     """
     if not hypothesis_keywords:
         return 0.0
@@ -158,13 +188,3 @@ def compute_paper_strength(cited_by_count: int, published: str | None) -> float:
     base = min(1.0, math.log1p(citation_rate) / math.log1p(30))
     longevity_bonus = 0.1 * min(1.0, years_active / 10) if cited_by_count else 0.0
     return round(min(1.0, base + longevity_bonus), 3)
-
-
-def compute_composite(relevance: float, citation: float, specificity: float) -> float:
-    """Weighted blend of the three ranking signals (relevance weighted highest)."""
-    score = (
-        W_RELEVANCE * relevance
-        + W_CITATION * citation
-        + W_SPECIFICITY * specificity
-    )
-    return round(score, 4)

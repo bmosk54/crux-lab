@@ -1,40 +1,49 @@
 """Evidence gatherer: a Python-orchestrated pipeline over a single Claude model.
 
 Pipeline stages:
-  1. generate_queries  (LLM)    — frame 3 supporting + 3 refuting search queries
-  2. collect_candidates (Python) — run the 6 searches, rank every hit
-  3. select top 10 per side (Python) — deterministic, relevance-weighted
-  4. fetch_abstracts   (Python) — pull abstracts for the ~20 finalists by ID
-  5. extract_evidence  (LLM)    — read abstracts, extract & classify claims
+  1. generate_queries   (LLM)    — frame 3 supporting + 3 refuting search queries
+  2. collect_candidates (Python) — dual-pass search + minimum-relevance gate
+  3. screen_candidates  (LLM)    — judge relevance & quality, pick top ~10 per side
+  4. attach_abstracts   (Python) — fetch abstracts for the finalists by ID
+  5. extract_evidence   (LLM)    — read abstracts, extract & classify claims
 
-Ranking (Python) blends relevance (highest weight), citation impact, and
-title specificity, so the model never has to guess calibrated numbers.
+Ranking uses the model's judgement (relevance first, then quality signals like
+citations/recency/specificity) rather than a hardcoded weighted formula. Python
+only applies a light minimum-relevance gate to drop obvious junk before screening.
 """
 
 from __future__ import annotations
 
-import json
-import re
+from dataclasses import dataclass, field
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
-
+from agents.llm import complete, parse_tagged_json
 from models.evidence import (
-    RELEVANCE_FLOOR_ESTABLISHED,
     CandidatePaper,
     EvidenceSet,
-    compute_composite,
     compute_paper_strength,
     compute_specificity,
     extract_keywords,
 )
 from tools.europepmc import fetch_abstracts, run_search
 
-MODEL = "sonnet"
 RELEVANCE_PAGE_SIZE = 20
 ESTABLISHED_PAGE_SIZE = 10
 ESTABLISHED_MIN_CITATIONS = 20
 TOP_PER_SIDE = 10
 ABSTRACT_CHAR_LIMIT = 1600
+
+
+@dataclass
+class GatherResult:
+    """Everything produced by the gathering pipeline (for output + debugging)."""
+
+    hypothesis: str
+    supporting_queries: list[str] = field(default_factory=list)
+    refuting_queries: list[str] = field(default_factory=list)
+    supporting_candidates: list[CandidatePaper] = field(default_factory=list)
+    refuting_candidates: list[CandidatePaper] = field(default_factory=list)
+    evidence: EvidenceSet | None = None
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 — query generation
@@ -64,13 +73,227 @@ Output EXACTLY this and nothing else:
 """.strip()
 
 
+def _fallback_queries(hypothesis: str) -> tuple[list[str], list[str]]:
+    return (
+        [
+            hypothesis,
+            f"{hypothesis} mechanism evidence",
+            f"{hypothesis} recent findings",
+        ],
+        [
+            f"{hypothesis} limitations",
+            f"{hypothesis} no effect OR null result",
+            f"{hypothesis} contradictory OR controversy",
+        ],
+    )
+
+
+async def generate_queries(hypothesis: str) -> tuple[list[str], list[str]]:
+    text = await complete(QUERY_GEN_SYSTEM, f"Hypothesis:\n\n{hypothesis}")
+    data = parse_tagged_json(text, "queries")
+    if isinstance(data, dict):
+        sup = [q for q in data.get("supporting_queries", []) if isinstance(q, str) and q.strip()]
+        ref = [q for q in data.get("refuting_queries", []) if isinstance(q, str) and q.strip()]
+        if sup and ref:
+            return sup, ref
+    return _fallback_queries(hypothesis)
+
+
 # ---------------------------------------------------------------------------
-# Stage 5 — evidence extraction
+# Stage 2 — discovery search + minimum-relevance gate
+# ---------------------------------------------------------------------------
+
+
+async def collect_candidates(
+    hypothesis: str,
+    supporting_queries: list[str],
+    refuting_queries: list[str],
+) -> list[CandidatePaper]:
+    """Run dual-pass discovery searches, dedupe, and apply a minimum-relevance gate.
+
+    No weighted ranking happens here — the model screens for relevance next.
+    """
+    keywords = extract_keywords(hypothesis)
+    candidates: dict[tuple[str, str], CandidatePaper] = {}
+
+    def register(hit: dict, side: str, established: bool) -> None:
+        source, ext_id = hit.get("source"), hit.get("id")
+        if not source or not ext_id:
+            return
+        key = (source, ext_id)
+        cand = candidates.get(key)
+        if cand is None:
+            cand = CandidatePaper(
+                source=source,
+                ext_id=ext_id,
+                title=hit.get("title") or "",
+                authors=hit.get("authors") or "",
+                journal=hit.get("journal"),
+                published=hit.get("published"),
+                pmid=hit.get("pmid"),
+                pmcid=hit.get("pmcid"),
+                doi=hit.get("doi"),
+                cited_by_count=int(hit.get("cited_by_count") or 0),
+            )
+            candidates[key] = cand
+        cand.found_count += 1
+        cand.established = cand.established or established
+        if side not in cand.pools:
+            cand.pools.append(side)
+
+    async def process(queries: list[str], side: str) -> None:
+        for q in queries:
+            # Pass A: relevance-sorted — best topical matches (including recent)
+            rel = await run_search(q, page_size=RELEVANCE_PAGE_SIZE, sort="relevance")
+            for hit in rel.get("results", []):
+                register(hit, side, established=False)
+            # Pass B: citation-sorted — guarantees established high-impact papers
+            # enter the pool even when relevance ordering buried them
+            est = await run_search(
+                q,
+                page_size=ESTABLISHED_PAGE_SIZE,
+                sort="citedByCount",
+                min_citations=ESTABLISHED_MIN_CITATIONS,
+            )
+            for hit in est.get("results", []):
+                register(hit, side, established=True)
+
+    await process(supporting_queries, "supporting")
+    await process(refuting_queries, "refuting")
+
+    # Minimum-relevance gate: keep a paper only if its title shares at least one
+    # keyword with the hypothesis, OR it is an established high-impact paper that
+    # earned its place via citations (its title may use different wording).
+    gated: list[CandidatePaper] = []
+    for cand in candidates.values():
+        cand.specificity = compute_specificity(cand.title, keywords)
+        if cand.specificity > 0 or cand.established:
+            gated.append(cand)
+    return gated
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — screen candidates with judgement (replaces weighted ranking)
+# ---------------------------------------------------------------------------
+
+SCREEN_SYSTEM = """
+You are screening candidate papers (titles only, no abstracts) to decide which are
+worth deep-reading as evidence about a hypothesis. You receive a numbered list with
+each paper's title, publication year, citation count, and which search surfaced it.
+
+Select the papers most worth reading:
+- up to 10 as SUPPORTING candidates (titles suggesting evidence the hypothesis is true)
+- up to 10 as REFUTING candidates (titles suggesting evidence against or limiting it)
+
+Use judgement, NOT a fixed formula:
+- RELEVANCE comes first. Does the title indicate the paper actually addresses the
+  hypothesis's specific variables? Exclude papers that are only loosely related
+  (reviews of adjacent topics, a different disease/organism with no clear link,
+  pure methods/assay papers). It is fine to exclude a highly-cited paper if it
+  isn't relevant, and fine to return fewer than 10 per side.
+- Then weigh quality signals together: citation impact, recency (new findings),
+  and how specific/empirical the title sounds (primary studies, trials, direct
+  measurements over broad narrative reviews).
+- Prefer a DIVERSE set of study types and angles over near-duplicate titles.
+
+A paper may appear in BOTH lists if its title suggests mixed or broadly relevant
+findings.
+
+Output EXACTLY this and nothing else:
+
+<selection>
+{"supporting": [paper numbers], "refuting": [paper numbers]}
+</selection>
+""".strip()
+
+
+def _format_screen_line(index: int, cand: CandidatePaper) -> str:
+    surfaced = "/".join(cand.pools) or "?"
+    year = (cand.published or "?")[:4]
+    return f"{index}. [{cand.cited_by_count} cit · {year} · {surfaced}] {cand.title}"
+
+
+def _coerce_indices(values: object, n: int) -> list[int]:
+    out: list[int] = []
+    if isinstance(values, list):
+        for v in values:
+            try:
+                i = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= i <= n and i not in out:
+                out.append(i)
+    return out
+
+
+async def screen_candidates(
+    hypothesis: str,
+    candidates: list[CandidatePaper],
+    top_per_side: int = TOP_PER_SIDE,
+) -> tuple[list[CandidatePaper], list[CandidatePaper]]:
+    if not candidates:
+        return [], []
+
+    ordered = sorted(candidates, key=lambda c: c.cited_by_count, reverse=True)
+    listing = "\n".join(_format_screen_line(i, c) for i, c in enumerate(ordered, 1))
+    prompt = f"Hypothesis:\n{hypothesis}\n\nCandidate papers ({len(ordered)}):\n{listing}"
+
+    text = await complete(SCREEN_SYSTEM, prompt)
+    data = parse_tagged_json(text, "selection") or {}
+    sup_idx = _coerce_indices(data.get("supporting"), len(ordered))[:top_per_side]
+    ref_idx = _coerce_indices(data.get("refuting"), len(ordered))[:top_per_side]
+
+    if not sup_idx and not ref_idx:
+        # Fallback: keep the most-cited from each original search pool
+        sup_idx = [i for i, c in enumerate(ordered, 1) if "supporting" in c.pools][:top_per_side]
+        ref_idx = [i for i, c in enumerate(ordered, 1) if "refuting" in c.pools][:top_per_side]
+
+    supporting = [ordered[i - 1] for i in sup_idx]
+    refuting = [ordered[i - 1] for i in ref_idx]
+
+    # Re-label pools to reflect the screening decision (used for the "retrieved as"
+    # hint downstream); a paper selected for both sides keeps both labels.
+    sup_keys = {(c.source, c.ext_id) for c in supporting}
+    ref_keys = {(c.source, c.ext_id) for c in refuting}
+    for cand in {(c.source, c.ext_id): c for c in [*supporting, *refuting]}.values():
+        key = (cand.source, cand.ext_id)
+        cand.pools = []
+        if key in sup_keys:
+            cand.pools.append("supporting")
+        if key in ref_keys:
+            cand.pools.append("refuting")
+
+    return supporting, refuting
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — fetch abstracts for the finalists
+# ---------------------------------------------------------------------------
+
+
+async def attach_abstracts(
+    supporting: list[CandidatePaper], refuting: list[CandidatePaper]
+) -> list[CandidatePaper]:
+    """Fetch abstracts for the unique union of finalists and attach them."""
+    union: dict[tuple[str, str], CandidatePaper] = {}
+    for cand in [*supporting, *refuting]:
+        union[(cand.source, cand.ext_id)] = cand
+
+    fetched = await fetch_abstracts(list(union.keys()))
+    for (_source, ext_id), cand in union.items():
+        record = fetched.get(ext_id)
+        if record and record.get("abstract"):
+            cand.abstract = record["abstract"]
+    return list(union.values())
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — extract evidence
 # ---------------------------------------------------------------------------
 
 EXTRACTION_SYSTEM = """
 You are a rigorous scientific evidence analyst. You are given a hypothesis and a
-set of candidate papers (already retrieved and ranked) with their abstracts.
+set of candidate papers (already screened for relevance) with their abstracts.
 
 Your job: read each abstract, extract specific claims, classify them, and select
 the final strongest papers on each side.
@@ -132,178 +355,6 @@ Output EXACTLY this and nothing after the closing tag:
 """.strip()
 
 
-# ---------------------------------------------------------------------------
-# LLM helper
-# ---------------------------------------------------------------------------
-
-
-async def _complete(system: str, prompt: str) -> str:
-    """Run a single-shot Claude completion (no tools) and return its text."""
-    options = ClaudeAgentOptions(
-        model=MODEL,
-        system_prompt=system,
-        max_turns=1,
-        allowed_tools=[],
-    )
-    out = ""
-    async for msg in query(prompt=prompt, options=options):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    out += block.text
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Stage 1 — generate queries
-# ---------------------------------------------------------------------------
-
-
-def _fallback_queries(hypothesis: str) -> tuple[list[str], list[str]]:
-    return (
-        [
-            hypothesis,
-            f"{hypothesis} mechanism evidence",
-            f"{hypothesis} recent findings",
-        ],
-        [
-            f"{hypothesis} limitations",
-            f"{hypothesis} no effect OR null result",
-            f"{hypothesis} contradictory OR controversy",
-        ],
-    )
-
-
-async def generate_queries(hypothesis: str) -> tuple[list[str], list[str]]:
-    text = await _complete(QUERY_GEN_SYSTEM, f"Hypothesis:\n\n{hypothesis}")
-    match = re.search(r"<queries>\s*(.*?)\s*</queries>", text, re.DOTALL)
-    if not match:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1).strip())
-            sup = [q for q in data.get("supporting_queries", []) if q.strip()]
-            ref = [q for q in data.get("refuting_queries", []) if q.strip()]
-            if sup and ref:
-                return sup, ref
-        except json.JSONDecodeError:
-            pass
-    return _fallback_queries(hypothesis)
-
-
-# ---------------------------------------------------------------------------
-# Stage 2-3 — search and rank
-# ---------------------------------------------------------------------------
-
-
-async def collect_candidates(
-    hypothesis: str,
-    supporting_queries: list[str],
-    refuting_queries: list[str],
-    top_per_side: int = TOP_PER_SIDE,
-) -> tuple[list[CandidatePaper], list[CandidatePaper]]:
-    """Run the discovery searches and rank all hits deterministically."""
-    keywords = extract_keywords(hypothesis)
-    candidates: dict[tuple[str, str], CandidatePaper] = {}
-
-    def register(hit: dict, side: str, rank_score: float, established: bool) -> None:
-        source, ext_id = hit.get("source"), hit.get("id")
-        if not source or not ext_id:
-            return
-        key = (source, ext_id)
-        cand = candidates.get(key)
-        if cand is None:
-            cand = CandidatePaper(
-                source=source,
-                ext_id=ext_id,
-                title=hit.get("title") or "",
-                authors=hit.get("authors") or "",
-                journal=hit.get("journal"),
-                published=hit.get("published"),
-                pmid=hit.get("pmid"),
-                pmcid=hit.get("pmcid"),
-                doi=hit.get("doi"),
-                cited_by_count=int(hit.get("cited_by_count") or 0),
-            )
-            candidates[key] = cand
-        cand.found_count += 1
-        cand.best_rank = max(cand.best_rank, rank_score)
-        cand.established = cand.established or established
-        if side not in cand.pools:
-            cand.pools.append(side)
-
-    async def process(queries: list[str], side: str) -> None:
-        for q in queries:
-            # Pass A: relevance-sorted — captures best topical matches (incl. recent)
-            rel = await run_search(q, page_size=RELEVANCE_PAGE_SIZE, sort="relevance")
-            hits = rel.get("results", [])
-            n = len(hits)
-            for i, hit in enumerate(hits):
-                register(hit, side, 1.0 - (i / n) if n else 0.0, established=False)
-
-            # Pass B: citation-sorted with a floor — guarantees established,
-            # high-impact papers enter the pool even if relevance buried them
-            est = await run_search(
-                q,
-                page_size=ESTABLISHED_PAGE_SIZE,
-                sort="citedByCount",
-                min_citations=ESTABLISHED_MIN_CITATIONS,
-            )
-            for hit in est.get("results", []):
-                register(hit, side, 0.0, established=True)
-
-    await process(supporting_queries, "supporting")
-    await process(refuting_queries, "refuting")
-
-    for cand in candidates.values():
-        relevance = cand.best_rank
-        if cand.established:
-            relevance = max(relevance, RELEVANCE_FLOOR_ESTABLISHED)
-        relevance = min(1.0, relevance + 0.05 * (cand.found_count - 1))
-        cand.relevance = round(relevance, 3)
-        cand.specificity = compute_specificity(cand.title, keywords)
-        cand.citation_score = compute_paper_strength(cand.cited_by_count, cand.published)
-        cand.composite = compute_composite(cand.relevance, cand.citation_score, cand.specificity)
-
-    supporting = sorted(
-        (c for c in candidates.values() if "supporting" in c.pools),
-        key=lambda c: c.composite,
-        reverse=True,
-    )[:top_per_side]
-    refuting = sorted(
-        (c for c in candidates.values() if "refuting" in c.pools),
-        key=lambda c: c.composite,
-        reverse=True,
-    )[:top_per_side]
-    return supporting, refuting
-
-
-# ---------------------------------------------------------------------------
-# Stage 4 — fetch abstracts for the finalists
-# ---------------------------------------------------------------------------
-
-
-async def attach_abstracts(
-    supporting: list[CandidatePaper], refuting: list[CandidatePaper]
-) -> list[CandidatePaper]:
-    """Fetch abstracts for the unique union of finalists and attach them."""
-    union: dict[tuple[str, str], CandidatePaper] = {}
-    for cand in [*supporting, *refuting]:
-        union[(cand.source, cand.ext_id)] = cand
-
-    fetched = await fetch_abstracts(list(union.keys()))
-    for (_source, ext_id), cand in union.items():
-        record = fetched.get(ext_id)
-        if record and record.get("abstract"):
-            cand.abstract = record["abstract"]
-    return list(union.values())
-
-
-# ---------------------------------------------------------------------------
-# Stage 5 — extract evidence
-# ---------------------------------------------------------------------------
-
-
 def _format_candidate_block(index: int, cand: CandidatePaper) -> str:
     abstract = (cand.abstract or "").strip()
     if len(abstract) > ABSTRACT_CHAR_LIMIT:
@@ -333,7 +384,7 @@ async def extract_evidence(hypothesis: str, papers: list[CandidatePaper]) -> Evi
         f"Hypothesis:\n{hypothesis}\n\n"
         f"Candidate papers ({len(papers_with_abstracts)}):\n\n{blocks}"
     )
-    text = await _complete(EXTRACTION_SYSTEM, prompt)
+    text = await complete(EXTRACTION_SYSTEM, prompt)
     evidence = _parse_evidence(text, hypothesis)
     _refresh_metadata(evidence, papers_with_abstracts)
     return evidence
@@ -344,7 +395,7 @@ async def extract_evidence(hypothesis: str, papers: list[CandidatePaper]) -> Evi
 # ---------------------------------------------------------------------------
 
 
-async def gather_evidence(hypothesis: str, *, verbose: bool = True) -> EvidenceSet:
+async def gather_evidence(hypothesis: str, *, verbose: bool = True) -> GatherResult:
     def log(msg: str) -> None:
         if verbose:
             print(msg)
@@ -354,17 +405,27 @@ async def gather_evidence(hypothesis: str, *, verbose: bool = True) -> EvidenceS
 
     n_queries = len(supporting_queries) + len(refuting_queries)
     log(f"  → running {n_queries * 2} discovery searches ({n_queries} queries × relevance+citation passes)...")
-    supporting, refuting = await collect_candidates(
-        hypothesis, supporting_queries, refuting_queries
-    )
+    candidates = await collect_candidates(hypothesis, supporting_queries, refuting_queries)
+    log(f"  → {len(candidates)} candidates passed the relevance gate")
 
-    log(f"  → ranked candidates: {len(supporting)} supporting, {len(refuting)} refuting")
+    log("  → screening candidates for relevance & quality...")
+    supporting, refuting = await screen_candidates(hypothesis, candidates)
+    log(f"  → selected {len(supporting)} supporting, {len(refuting)} refuting")
+
     papers = await attach_abstracts(supporting, refuting)
     log(f"  → fetched abstracts for {sum(1 for p in papers if p.abstract.strip())} papers")
 
     log("  → reading abstracts and extracting evidence...")
     evidence = await extract_evidence(hypothesis, papers)
-    return evidence
+
+    return GatherResult(
+        hypothesis=hypothesis,
+        supporting_queries=supporting_queries,
+        refuting_queries=refuting_queries,
+        supporting_candidates=supporting,
+        refuting_candidates=refuting,
+        evidence=evidence,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -373,14 +434,11 @@ async def gather_evidence(hypothesis: str, *, verbose: bool = True) -> EvidenceS
 
 
 def _parse_evidence(text: str, hypothesis: str) -> EvidenceSet:
-    match = re.search(r"<evidence>\s*(.*?)\s*</evidence>", text, re.DOTALL)
-    if not match:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
+    data = parse_tagged_json(text, "evidence")
+    if isinstance(data, dict):
         try:
-            data = json.loads(match.group(1).strip())
             return EvidenceSet(**data)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             print(f"[warning] Could not parse evidence JSON: {exc}")
     return EvidenceSet(hypothesis=hypothesis)
 
