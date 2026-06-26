@@ -13,27 +13,30 @@ from dataclasses import dataclass
 @dataclass
 class PipelineConfig:
     # --- which stages to run ---
-    run_synthesis: bool = True   # gathering always runs; this gates synthesis
-    run_verdict: bool = True     # requires synthesis
+    run_synthesis: bool = True   # gathering always runs; this gates synthesis+verdict
+
+    # --- optional single coverage gate (Change 6); off by default to protect the
+    #     5-minute ceiling. When on, fires at most ONE extra targeted search + resynth.
+    coverage_gate: bool = False
 
     # --- which step outputs to print (debugging visibility) ---
+    show_decomposition: bool = True
     show_queries: bool = True
     show_candidates: bool = True
     show_evidence: bool = True
-    show_synthesis: bool = True
     show_verdict: bool = True
 
     # --- progress logging (the "→ ..." lines) ---
     verbose: bool = True
 
-    # --- per-stage model selection ---
-    # Query gen is cheap and predictable (just terminology reformulation), so
-    # haiku is sufficient. All reasoning-heavy steps use sonnet.
+    # --- per-stage model selection (BARBELL) ---
+    # Premium (reasoning-heavy): decomposition (stage 0) + synthesis/verdict (stage 4).
+    # Cheap/fast (high-volume): query gen, title ranking, abstract-pass extraction.
+    model_decomposition: str = "sonnet"
     model_query_gen: str = "haiku"
-    model_screening: str = "sonnet"
-    model_extraction: str = "sonnet"
+    model_title_rank: str = "haiku"
+    model_abstract_pass: str = "haiku"
     model_synthesis: str = "sonnet"
-    model_verdict: str = "sonnet"
 
 
 # Default config used by main.py. Edit these to quickly turn steps on/off.
@@ -44,6 +47,13 @@ DEFAULT_CONFIG = PipelineConfig()
 # stress a different behaviour (mixed evidence, decomposable claims, strong vs.
 # contested causation, animal-vs-human gaps, etc.).
 EXAMPLE_CLAIMS = [
+    # Regression fixture: conjunctive sub-claims, a load-bearing "root cause"
+    # modifier, a specific drug/program entity, and a likely null-replication
+    # counter-paper. Should reject the literal framing but score a re-scoped
+    # "damage-repair adjunct" steelman materially higher.
+    "7-ketocholesterol-laden foam cells are the root cause of atherosclerosis; "
+    "removing this oxidized cholesterol with cyclodextrins will restore "
+    "cardiovascular self-repair and is a druggable therapeutic.",
     # Strong, well-replicated causal claim — should score high with confidence.
     "SGLT2 inhibitors reduce cardiovascular mortality in patients with heart failure.",
     # Decomposable: 'shortening occurs' (supported) vs 'is a primary cause' (contested).

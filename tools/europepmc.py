@@ -10,14 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import httpx
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+EUROPEPMC_FULLTEXT_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 MAX_PAGE_SIZE = 25
 _SORT_MAP = {"citedByCount": "CITED desc", "date": "P_PDATE_D desc"}
+
+# Sections worth extracting for pivotal papers (Results/Discussion carry the
+# detail abstracts hide — e.g. whether a result is condition-specific).
+_FULLTEXT_SECTION_PATTERN = re.compile(r"result|discussion|conclusion|finding", re.IGNORECASE)
+_FULLTEXT_MAX_CHARS = 4000
 
 SEARCH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -78,7 +86,7 @@ def _format_hit(hit: dict[str, Any]) -> dict[str, Any]:
         "pmid": hit.get("pmid"),
         "pmcid": hit.get("pmcid"),
         "doi": hit.get("doi"),
-        "is_open_access": hit.get("isOpenAccess"),
+        "is_open_access": str(hit.get("isOpenAccess", "")).upper() == "Y",
         "cited_by_count": hit.get("citedByCount"),
         "abstract": hit.get("abstractText"),
     }
@@ -172,6 +180,88 @@ async def fetch_abstracts(refs: list[tuple[str, str]]) -> dict[str, dict[str, An
         if isinstance(result, dict) and result:
             out[ext_id] = result
     return out
+
+
+# ---------------------------------------------------------------------------
+# Full-text (Open Access) section extraction for pivotal papers
+# ---------------------------------------------------------------------------
+
+
+def _is_descendant(node: ET.Element, ancestor: ET.Element) -> bool:
+    return any(child is node for child in ancestor.iter() if child is not ancestor)
+
+
+def _extract_sections(xml: str) -> str | None:
+    """Pull Results/Discussion/Conclusion text out of JATS full-text XML.
+
+    Returns cleaned plain text (capped), or None if the body can't be parsed or
+    holds none of the target sections.
+    """
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+
+    body = root.find(".//body")
+    if body is None:
+        return None
+
+    matched: list[ET.Element] = []
+    for sec in body.iter("sec"):
+        title_el = sec.find("title")
+        if title_el is not None and title_el.text and _FULLTEXT_SECTION_PATTERN.search(title_el.text):
+            matched.append(sec)
+
+    # Keep only top-level matches so nested subsections aren't duplicated.
+    top = [s for s in matched if not any(_is_descendant(s, o) for o in matched if o is not s)]
+    if not top:
+        return None
+
+    chunks: list[str] = []
+    for sec in top:
+        title_el = sec.find("title")
+        title = (title_el.text or "").strip() if title_el is not None else ""
+        text = " ".join(t.strip() for t in sec.itertext() if t and t.strip())
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            chunks.append(f"## {title}\n{text}" if title else text)
+
+    out = "\n\n".join(chunks).strip()
+    if not out:
+        return None
+    if len(out) > _FULLTEXT_MAX_CHARS:
+        out = out[:_FULLTEXT_MAX_CHARS].rstrip() + "…"
+    return out
+
+
+async def _fetch_fulltext_one(client: httpx.AsyncClient, pmcid: str) -> str | None:
+    url = EUROPEPMC_FULLTEXT_URL.format(pmcid=pmcid)
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    return _extract_sections(response.text)
+
+
+async def fetch_fulltext_sections(pmcids: list[str]) -> dict[str, str]:
+    """Fetch OA full text for the given PMCIDs in parallel; extract Results/Discussion.
+
+    Returns {pmcid: extracted_text} only for papers where extraction succeeded.
+    """
+    pmcids = [p for p in pmcids if p]
+    if not pmcids:
+        return {}
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        results = await asyncio.gather(
+            *(_fetch_fulltext_one(client, p) for p in pmcids),
+            return_exceptions=True,
+        )
+    return {
+        pmcid: result
+        for pmcid, result in zip(pmcids, results)
+        if isinstance(result, str) and result
+    }
 
 
 @tool(

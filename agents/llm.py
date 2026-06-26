@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -11,8 +12,7 @@ from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, qu
 MODEL = "sonnet"
 
 
-async def complete(system: str, prompt: str, *, model: str = MODEL) -> str:
-    """Run a single-shot Claude completion (no tools) and return its text."""
+async def _complete_once(system: str, prompt: str, *, model: str) -> str:
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=system,
@@ -26,6 +26,21 @@ async def complete(system: str, prompt: str, *, model: str = MODEL) -> str:
                 if isinstance(block, TextBlock):
                     out += block.text
     return out
+
+
+async def complete(system: str, prompt: str, *, model: str = MODEL, retries: int = 1) -> str:
+    """Single-shot Claude completion (no tools) with a small retry for transient
+    SDK errors (the agent SDK intermittently raises e.g. "error result: success"
+    or "Reached maximum number of turns"). Returns the assistant text."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await _complete_once(system, prompt, model=model)
+        except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception
+            last_exc = exc
+            if attempt < retries:
+                await asyncio.sleep(1.5)
+    raise last_exc  # type: ignore[misc]
 
 
 def parse_tagged_json(text: str, tag: str) -> Any | None:
