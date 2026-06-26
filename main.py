@@ -158,7 +158,13 @@ async def run(claim: str, config: PipelineConfig = DEFAULT_CONFIG) -> None:
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env in the project root.")
 
     print("\n🔬 Gathering evidence (this may take a couple of minutes):\n")
-    result = await gather_evidence(claim, verbose=config.verbose)
+    result = await gather_evidence(
+        claim,
+        verbose=config.verbose,
+        model_query_gen=config.model_query_gen,
+        model_screening=config.model_screening,
+        model_extraction=config.model_extraction,
+    )
 
     if config.show_queries:
         display_queries(result)
@@ -169,12 +175,16 @@ async def run(claim: str, config: PipelineConfig = DEFAULT_CONFIG) -> None:
 
     synthesis: Synthesis | None = None
     if config.run_synthesis and result.evidence is not None:
-        synthesis = await synthesize(result.evidence, verbose=config.verbose)
+        synthesis = await synthesize(
+            result.evidence, verbose=config.verbose, model=config.model_synthesis
+        )
         if config.show_synthesis:
             display_synthesis(synthesis)
 
     if config.run_verdict and synthesis is not None:
-        verdict = await generate_verdict(claim, synthesis, verbose=config.verbose)
+        verdict = await generate_verdict(
+            claim, synthesis, verbose=config.verbose, model=config.model_verdict
+        )
         if config.show_verdict:
             display_verdict(verdict)
 

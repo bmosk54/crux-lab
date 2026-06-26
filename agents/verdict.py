@@ -73,16 +73,16 @@ def _synthesis_to_text(synthesis: Synthesis) -> str:
 
 
 async def generate_verdict(
-    claim: str, synthesis: Synthesis, *, verbose: bool = True
+    claim: str, synthesis: Synthesis, *, verbose: bool = True, model: str = "sonnet"
 ) -> Verdict:
     if verbose:
-        print("  → weighing the verdict...")
+        print(f"  → weighing the verdict (model: {model})...")
 
     prompt = (
         f"Original claim:\n{claim}\n\n"
         f"Synthesis of the evidence:\n{_synthesis_to_text(synthesis)}"
     )
-    text = await complete(VERDICT_SYSTEM, prompt)
+    text = await complete(VERDICT_SYSTEM, prompt, model=model)
     data = parse_tagged_json(text, "verdict")
     if isinstance(data, dict):
         try:

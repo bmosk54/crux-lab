@@ -26,6 +26,15 @@ class PipelineConfig:
     # --- progress logging (the "→ ..." lines) ---
     verbose: bool = True
 
+    # --- per-stage model selection ---
+    # Query gen is cheap and predictable (just terminology reformulation), so
+    # haiku is sufficient. All reasoning-heavy steps use sonnet.
+    model_query_gen: str = "haiku"
+    model_screening: str = "sonnet"
+    model_extraction: str = "sonnet"
+    model_synthesis: str = "sonnet"
+    model_verdict: str = "sonnet"
+
 
 # Default config used by main.py. Edit these to quickly turn steps on/off.
 DEFAULT_CONFIG = PipelineConfig()

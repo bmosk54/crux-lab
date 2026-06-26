@@ -88,8 +88,8 @@ def _fallback_queries(hypothesis: str) -> tuple[list[str], list[str]]:
     )
 
 
-async def generate_queries(hypothesis: str) -> tuple[list[str], list[str]]:
-    text = await complete(QUERY_GEN_SYSTEM, f"Hypothesis:\n\n{hypothesis}")
+async def generate_queries(hypothesis: str, *, model: str = "haiku") -> tuple[list[str], list[str]]:
+    text = await complete(QUERY_GEN_SYSTEM, f"Hypothesis:\n\n{hypothesis}", model=model)
     data = parse_tagged_json(text, "queries")
     if isinstance(data, dict):
         sup = [q for q in data.get("supporting_queries", []) if isinstance(q, str) and q.strip()]
@@ -230,6 +230,8 @@ async def screen_candidates(
     hypothesis: str,
     candidates: list[CandidatePaper],
     top_per_side: int = TOP_PER_SIDE,
+    *,
+    model: str = "sonnet",
 ) -> tuple[list[CandidatePaper], list[CandidatePaper]]:
     if not candidates:
         return [], []
@@ -238,7 +240,7 @@ async def screen_candidates(
     listing = "\n".join(_format_screen_line(i, c) for i, c in enumerate(ordered, 1))
     prompt = f"Hypothesis:\n{hypothesis}\n\nCandidate papers ({len(ordered)}):\n{listing}"
 
-    text = await complete(SCREEN_SYSTEM, prompt)
+    text = await complete(SCREEN_SYSTEM, prompt, model=model)
     data = parse_tagged_json(text, "selection") or {}
     sup_idx = _coerce_indices(data.get("supporting"), len(ordered))[:top_per_side]
     ref_idx = _coerce_indices(data.get("refuting"), len(ordered))[:top_per_side]
@@ -372,7 +374,9 @@ def _format_candidate_block(index: int, cand: CandidatePaper) -> str:
     )
 
 
-async def extract_evidence(hypothesis: str, papers: list[CandidatePaper]) -> EvidenceSet:
+async def extract_evidence(
+    hypothesis: str, papers: list[CandidatePaper], *, model: str = "sonnet"
+) -> EvidenceSet:
     papers_with_abstracts = [p for p in papers if p.abstract.strip()]
     if not papers_with_abstracts:
         return EvidenceSet(hypothesis=hypothesis)
@@ -384,7 +388,7 @@ async def extract_evidence(hypothesis: str, papers: list[CandidatePaper]) -> Evi
         f"Hypothesis:\n{hypothesis}\n\n"
         f"Candidate papers ({len(papers_with_abstracts)}):\n\n{blocks}"
     )
-    text = await complete(EXTRACTION_SYSTEM, prompt)
+    text = await complete(EXTRACTION_SYSTEM, prompt, model=model)
     evidence = _parse_evidence(text, hypothesis)
     _refresh_metadata(evidence, papers_with_abstracts)
     return evidence
@@ -395,28 +399,39 @@ async def extract_evidence(hypothesis: str, papers: list[CandidatePaper]) -> Evi
 # ---------------------------------------------------------------------------
 
 
-async def gather_evidence(hypothesis: str, *, verbose: bool = True) -> GatherResult:
+async def gather_evidence(
+    hypothesis: str,
+    *,
+    verbose: bool = True,
+    model_query_gen: str = "haiku",
+    model_screening: str = "sonnet",
+    model_extraction: str = "sonnet",
+) -> GatherResult:
     def log(msg: str) -> None:
         if verbose:
             print(msg)
 
-    log("  → generating search queries...")
-    supporting_queries, refuting_queries = await generate_queries(hypothesis)
+    log(f"  → generating search queries (model: {model_query_gen})...")
+    supporting_queries, refuting_queries = await generate_queries(
+        hypothesis, model=model_query_gen
+    )
 
     n_queries = len(supporting_queries) + len(refuting_queries)
     log(f"  → running {n_queries * 2} discovery searches ({n_queries} queries × relevance+citation passes)...")
     candidates = await collect_candidates(hypothesis, supporting_queries, refuting_queries)
     log(f"  → {len(candidates)} candidates passed the relevance gate")
 
-    log("  → screening candidates for relevance & quality...")
-    supporting, refuting = await screen_candidates(hypothesis, candidates)
+    log(f"  → screening candidates (model: {model_screening})...")
+    supporting, refuting = await screen_candidates(
+        hypothesis, candidates, model=model_screening
+    )
     log(f"  → selected {len(supporting)} supporting, {len(refuting)} refuting")
 
     papers = await attach_abstracts(supporting, refuting)
     log(f"  → fetched abstracts for {sum(1 for p in papers if p.abstract.strip())} papers")
 
-    log("  → reading abstracts and extracting evidence...")
-    evidence = await extract_evidence(hypothesis, papers)
+    log(f"  → extracting evidence (model: {model_extraction})...")
+    evidence = await extract_evidence(hypothesis, papers, model=model_extraction)
 
     return GatherResult(
         hypothesis=hypothesis,

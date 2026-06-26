@@ -69,9 +69,11 @@ def _evidence_to_text(evidence: EvidenceSet) -> str:
     return f"SUPPORTING PAPERS:\n{sup}\n\nREFUTING PAPERS:\n{ref}"
 
 
-async def synthesize(evidence: EvidenceSet, *, verbose: bool = True) -> Synthesis:
+async def synthesize(
+    evidence: EvidenceSet, *, verbose: bool = True, model: str = "sonnet"
+) -> Synthesis:
     if verbose:
-        print("  → synthesizing ranked reasons and summaries...")
+        print(f"  → synthesizing ranked reasons and summaries (model: {model})...")
 
     if not evidence.supporting_papers and not evidence.refuting_papers:
         return Synthesis(
@@ -83,7 +85,7 @@ async def synthesize(evidence: EvidenceSet, *, verbose: bool = True) -> Synthesi
         f"Hypothesis:\n{evidence.hypothesis}\n\n"
         f"Evidence:\n{_evidence_to_text(evidence)}"
     )
-    text = await complete(SYNTH_SYSTEM, prompt)
+    text = await complete(SYNTH_SYSTEM, prompt, model=model)
     data = parse_tagged_json(text, "synthesis")
     if isinstance(data, dict):
         try:
