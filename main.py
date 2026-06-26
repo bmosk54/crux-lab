@@ -74,7 +74,7 @@ async def run(hypothesis: str) -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env in the project root.")
 
-    print(f"\n🔬 Searching literature for evidence...\n   (This may take 30-60 seconds)\n")
+    print("\n🔬 Gathering evidence (this may take 1-2 minutes):\n")
     evidence = await gather_evidence(hypothesis)
     display_evidence(evidence)
 
